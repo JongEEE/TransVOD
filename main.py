@@ -24,7 +24,7 @@ import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 from models import build_model
 
-
+# 定义一个命令行参数解析器，相当于键值对，第一个为Key，即参数，后面的default是默认参数值，type则是参数值的数据类型
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
     parser.add_argument('--lr', default=2e-4, type=float)
@@ -135,7 +135,13 @@ def get_args_parser():
 
 
 def main(args):
+
+    # 0 读取参数，进行项目启动的环境设置，模块选择等
+
+    # 0-1、打印 dataset_file 参数，附加标识符
     print(args.dataset_file, 11111111)
+
+    # 0-2、根据不同的参数值导入不同的模块，可以根据不同的数据集类型，导入不同的训练逻辑和工具函数
     if args.dataset_file == "vid_single":
         from engine_single import evaluate, train_one_epoch
         import util.misc as utils
@@ -145,31 +151,41 @@ def main(args):
         import util.misc_multi as utils
 
     print(args.dataset_file)
+
+    # 0-3、训练的设备参数
     device = torch.device(args.device)
+
+    # 0-4、初始化分布式训练模式
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
 
+    # 0-5、检查 frozen_weights 参数，需要保证 masks 参数为 true
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
 
 
-    # fix the seed for reproducibility
+    # fix the seed for reproducibility，固定随机种子确保可重复性
+    # 0-6、为pytorch、numpy、random模块设置种子
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
+    # 0-7、构建模型并移动到指定设备上
     model, criterion, postprocessors = build_model(args)
     model.to(device)
 
+    # 0-8、模型的参数统计
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
+    # 0-9、构建数据集
     dataset_train = build_dataset(image_set='train_joint', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
 
+    # 0-10、设置采样器，判断是否是分布式训练模式，需要进行不同的设置
     if args.distributed:
         if args.cache_mode:
             sampler_train = samplers.NodeDistributedSampler(dataset_train)
@@ -181,9 +197,11 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
+    # 将数据分成多个batch
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
-
+    
+    # 创建数据加载器，用于从数据集中加载数据，支持多线程读取和批次处理
     data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
                                    collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                    pin_memory=True)
@@ -192,6 +210,7 @@ def main(args):
                                  pin_memory=True)
 
     # lr_backbone_names = ["backbone.0", "backbone.neck", "input_proj", "transformer.encoder"]
+    # 定义一个函数，用于检查参数名n，是否包含在 name_keywords，如果存在，返回 true，否则返回 false
     def match_name_keywords(n, name_keywords):
         out = False
         for b in name_keywords:
@@ -200,9 +219,11 @@ def main(args):
                 break
         return out
 
+    # 打印模型的参数名
     for n, p in model_without_ddp.named_parameters():
         print(n)
 
+    # 创建参数组，第一组参数
     param_dicts = [
         {
             "params":
@@ -219,6 +240,7 @@ def main(args):
             "lr": args.lr * args.lr_linear_proj_mult,
         }
     ]
+    # 设置优化器，根据命令行参数选择优化器
     if args.sgd:
         optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
                                     weight_decay=args.weight_decay)
@@ -226,12 +248,16 @@ def main(args):
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                       weight_decay=args.weight_decay)
     print(args.lr_drop_epochs)
+
+    # 设置学习率调度器
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop_epochs)
 
+    # 如果启用了分布式训练模式，需要将模型包装成 DistributedDataParallel 模式
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
+    # 选择数据集的API
     if args.dataset_file == "coco_panoptic":
         # We also evaluate AP during panoptic training, on original coco DS
         coco_val = datasets.coco.build("val", args)
@@ -239,11 +265,14 @@ def main(args):
     else:
         base_ds = get_coco_api_from_dataset(dataset_val)
 
+    # 加载冻结权重
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
+    # 创建输出目录对象
     output_dir = Path(args.output_dir)
+    # 加载权重
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -251,6 +280,7 @@ def main(args):
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
 
+        # 加载权重到模型
         if args.eval:
             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         else:
@@ -268,6 +298,7 @@ def main(args):
 	                    param.requires_grad = True
 	                else:
 	                    param.requires_grad = False
+            # 加载处理后的权重
             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(tmp_dict, strict=False)
 
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
@@ -282,6 +313,7 @@ def main(args):
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
 
+    # 1、开始训练
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
@@ -322,7 +354,7 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
-
+# 这是整个项目的启动类，创建命令行参数解析器，解析参数，并将参数传入main函数
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Deformable DETR training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
